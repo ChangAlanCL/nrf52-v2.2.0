@@ -76,6 +76,43 @@ LOG_MODULE_REGISTER(usb_device);
 #include <os_desc.h>
 #include "usb_transfer.h"
 
+#define USB_DESC_TYPE_COUNT         7
+#define MAX_DESCRIPTOR_INDEX        4
+
+struct usb_descriptor_lookup {
+	const uint8_t *ptr;
+	uint16_t length;
+};
+
+static struct usb_descriptor_lookup descriptor_table[USB_DESC_TYPE_COUNT][MAX_DESCRIPTOR_INDEX];
+
+#define USB_IN_NUM_BUFFERS       3                       // Number of preallocated buffers
+#define USB_IN_MAX_PACKET_SIZE   64                      // Match your USB IN endpoint MPS
+#define USB_IN_MAX_TRANSFER_SIZE (64 * 32)               // Max per-buffer transfer size (~2 KB)
+
+// IN transfer state per buffer
+struct usb_in_transfer {
+	uint8_t buffer[USB_IN_MAX_TRANSFER_SIZE];
+	uint32_t length;
+	uint32_t offset;
+	bool in_use;
+};
+
+// Global transfer buffers
+static struct usb_in_transfer usb_in_buffers[USB_IN_NUM_BUFFERS];
+
+// Index of the buffer currently being transmitted
+static int current_in_buf = -1;
+
+// Track next free buffer to queue
+static int next_queue_slot = 0;
+
+// Track how many buffers are queued
+static int queued_count = 0;
+
+// Your IN endpoint address (update if needed)
+static const uint8_t usb_in_ep = 0x81;
+
 #define MAX_DESC_HANDLERS           4 /** Device, interface, endpoint, other */
 
 /* general descriptor field offsets */
@@ -166,6 +203,46 @@ static void usb_print_setup(struct usb_setup_packet *setup)
 		setup->wLength);
 }
 
+static void usb_in_kick(void)
+{
+	if (current_in_buf == -1 || !usb_in_buffers[current_in_buf].in_use) {
+		LOG_DBG("usb_in_kick: nothing to send");
+		return;
+	}
+
+	struct usb_in_transfer *xfer = &usb_in_buffers[current_in_buf];
+
+	uint32_t remaining = xfer->length - xfer->offset;
+	if (remaining == 0) {
+		LOG_DBG("usb_in_kick: transfer complete on buffer %d", current_in_buf);
+		xfer->in_use = false;
+		queued_count--;
+
+		// Find the next in-use buffer
+		for (int i = 0; i < USB_IN_NUM_BUFFERS; i++) {
+			if (usb_in_buffers[i].in_use) {
+				current_in_buf = i;
+				usb_in_kick();
+				return;
+			}
+		}
+
+		current_in_buf = -1;
+		return;
+	}
+
+	uint32_t chunk = MIN(remaining, USB_IN_MAX_PACKET_SIZE);
+	uint32_t written = 0;
+
+	int ret = usb_dc_ep_write(usb_in_ep, xfer->buffer + xfer->offset, chunk, &written);
+	if (ret != 0) {
+		LOG_ERR("usb_dc_ep_write failed: %d", ret);
+		return;
+	}
+
+	xfer->offset += written;
+}
+
 static void usb_reset_alt_setting(void)
 {
 	memset(usb_dev.alt_setting, 0, ARRAY_SIZE(usb_dev.alt_setting));
@@ -236,32 +313,28 @@ static bool usb_handle_request(struct usb_setup_packet *setup,
 static void usb_data_to_host(void)
 {
 	if (usb_dev.zlp_flag == false) {
-		uint32_t chunk = usb_dev.data_buf_residue;
+		uint32_t chunk;
 
-		/*Always EP0 for control*/
-		usb_write(USB_CONTROL_EP_IN, usb_dev.data_buf,
-			  usb_dev.data_buf_residue, &chunk);
-		usb_dev.data_buf += chunk;
-		usb_dev.data_buf_residue -= chunk;
+		/* Send only up to USB_MAX_CTRL_MPS */
+		chunk = MIN(usb_dev.data_buf_residue, USB_MAX_CTRL_MPS);
 
-		/*
-		 * Set ZLP flag when host asks for a bigger length and the
-		 * last chunk is wMaxPacketSize long, to indicate the last
-		 * packet.
-		 */
-		if (!usb_dev.data_buf_residue && chunk &&
-		    usb_dev.setup.wLength > usb_dev.data_buf_len) {
-			/* Send less data as requested during the Setup stage */
-			if (!(usb_dev.data_buf_len % USB_MAX_CTRL_MPS)) {
-				/* Transfers a zero-length packet */
-				LOG_DBG("ZLP, requested %u , length %u ",
-					usb_dev.setup.wLength,
-					usb_dev.data_buf_len);
+		if (chunk == 0) {
+			/* Nothing left to send, check for ZLP requirement */
+			if ((usb_dev.setup.wLength > usb_dev.data_buf_len) &&
+			    (usb_dev.data_buf_len % USB_MAX_CTRL_MPS == 0)) {
+				LOG_DBG("Sending ZLP");
 				usb_dev.zlp_flag = true;
+			} else {
+				return; // done
 			}
 		}
 
+		usb_write(USB_CONTROL_EP_IN, usb_dev.data_buf, chunk, &chunk);
+		usb_dev.data_buf += chunk;
+		usb_dev.data_buf_residue -= chunk;
+
 	} else {
+		/* Send Zero Length Packet */
 		usb_dev.zlp_flag = false;
 		usb_dc_ep_write(USB_CONTROL_EP_IN, NULL, 0, NULL);
 	}
@@ -412,7 +485,40 @@ static void usb_register_request_handler(int32_t type,
 static void usb_register_descriptors(const uint8_t *usb_descriptors)
 {
 	usb_dev.descriptors = usb_descriptors;
+
+	/* Clear and populate descriptor lookup table */
+	memset(descriptor_table, 0, sizeof(descriptor_table));
+
+	const uint8_t *p = usb_descriptors;
+
+	while (p[DESC_bLength] != 0U) {
+		uint8_t type = p[DESC_bDescriptorType];
+
+		/* Skip types we don't index */
+		if (type >= USB_DESC_TYPE_COUNT) {
+			goto next;
+		}
+
+		/* Find next free slot for this descriptor type */
+		for (int i = 0; i < MAX_DESCRIPTOR_INDEX; i++) {
+			if (descriptor_table[type][i].ptr == NULL) {
+				descriptor_table[type][i].ptr = p;
+
+				if (type == USB_DESC_CONFIGURATION) {
+					descriptor_table[type][i].length = (p[CONF_DESC_wTotalLength]) |
+					                                   (p[CONF_DESC_wTotalLength + 1] << 8);
+				} else {
+					descriptor_table[type][i].length = p[DESC_bLength];
+				}
+				break;
+			}
+		}
+
+	next:
+		p += p[DESC_bLength];
+	}
 }
+
 
 static bool usb_get_status(struct usb_setup_packet *setup,
 			   int32_t *len, uint8_t **data_buf)
@@ -452,60 +558,33 @@ static bool usb_get_status(struct usb_setup_packet *setup,
 static bool usb_get_descriptor(struct usb_setup_packet *setup,
 			       int32_t *len, uint8_t **data)
 {
-	uint8_t type = 0U;
-	uint8_t index = 0U;
-	uint8_t *p = NULL;
-	uint32_t cur_index = 0U;
-	bool found = false;
+	uint8_t type = USB_GET_DESCRIPTOR_TYPE(setup->wValue);
+	uint8_t index = USB_GET_DESCRIPTOR_INDEX(setup->wValue);
 
-	LOG_DBG("Get Descriptor request");
-	type = USB_GET_DESCRIPTOR_TYPE(setup->wValue);
-	index = USB_GET_DESCRIPTOR_INDEX(setup->wValue);
+	LOG_DBG("Get Descriptor: type 0x%x, index %u", type, index);
 
 	/*
-	 * Invalid types of descriptors,
-	 * see USB Spec. Revision 2.0, 9.4.3 Get Descriptor
+	 * Reject unsupported descriptor types per USB 2.0 Spec, Table 9-5
+	 * Interface and Endpoint descriptors are not valid for GET_DESCRIPTOR
 	 */
 	if ((type == USB_DESC_INTERFACE) || (type == USB_DESC_ENDPOINT) ||
-	    (type > USB_DESC_OTHER_SPEED)) {
+	    (type > USB_DESC_OTHER_SPEED) || type >= USB_DESC_TYPE_COUNT ||
+	    index >= MAX_DESCRIPTOR_INDEX) {
+		LOG_DBG("Invalid descriptor request: type 0x%x, index %u", type, index);
 		return false;
 	}
 
-	p = (uint8_t *)usb_dev.descriptors;
-	cur_index = 0U;
+	const struct usb_descriptor_lookup *desc = &descriptor_table[type][index];
 
-	while (p[DESC_bLength] != 0U) {
-		if (p[DESC_bDescriptorType] == type) {
-			if (cur_index == index) {
-				found = true;
-				break;
-			}
-			cur_index++;
-		}
-		/* skip to next descriptor */
-		p += p[DESC_bLength];
+	if (desc->ptr == NULL || desc->length == 0) {
+		LOG_DBG("Descriptor not found: type 0x%x, index %u", type, index);
+		return false;
 	}
 
-	if (found) {
-		/* set data pointer */
-		*data = p;
-		/* get length from structure */
-		if (type == USB_DESC_CONFIGURATION) {
-			/* configuration descriptor is an
-			 * exception, length is at offset
-			 * 2 and 3
-			 */
-			*len = (p[CONF_DESC_wTotalLength]) |
-			    (p[CONF_DESC_wTotalLength + 1] << 8);
-		} else {
-			/* normally length is at offset 0 */
-			*len = p[DESC_bLength];
-		}
-	} else {
-		/* nothing found */
-		LOG_DBG("Desc %x not found!", setup->wValue);
-	}
-	return found;
+	*data = (uint8_t *)desc->ptr;
+	*len = desc->length;
+
+	return true;
 }
 
 /*
@@ -1311,8 +1390,8 @@ int usb_write(uint8_t ep, const uint8_t *data, uint32_t data_len, uint32_t *byte
 	do {
 		ret = usb_dc_ep_write(ep, data, data_len, bytes_ret);
 		if (ret == -EAGAIN) {
-			LOG_WRN("Failed to write endpoint buffer 0x%02x", ep);
-			k_yield();
+			LOG_WRN("usb_write: ep 0x%02x EAGAIN, busy wait", ep);
+			k_busy_wait(10);  // Short wait is often enough for USB IN to unblock
 		}
 
 	} while (ret == -EAGAIN && tries--);
@@ -1629,5 +1708,65 @@ static int usb_device_init(const struct device *dev)
 
 	return 0;
 }
+
+bool usb_in_enqueue(const uint8_t *data, uint32_t len)
+{
+	if (queued_count >= USB_IN_NUM_BUFFERS) {
+		LOG_WRN("usb_in_enqueue: all buffers in use");
+		return false;
+	}
+
+	struct usb_in_transfer *xfer = &usb_in_buffers[next_queue_slot];
+
+	if (xfer->in_use) {
+		LOG_ERR("usb_in_enqueue: selected buffer is still marked in_use!");
+		return false;
+	}
+
+	if (len > USB_IN_MAX_TRANSFER_SIZE) {
+		LOG_ERR("usb_in_enqueue: data too large (%u bytes)", len);
+		return false;
+	}
+
+	memcpy(xfer->buffer, data, len);
+	xfer->length = len;
+	xfer->offset = 0;
+	xfer->in_use = true;
+
+	LOG_DBG("usb_in_enqueue: queued %u bytes in buffer %d", len, next_queue_slot);
+
+	queued_count++;
+
+	// If nothing is currently transmitting, start immediately
+	if (current_in_buf == -1) {
+		current_in_buf = next_queue_slot;
+		usb_in_kick();  // Start the USB transfer pipeline
+	}
+
+	// Advance to next free buffer slot
+	next_queue_slot = (next_queue_slot + 1) % USB_IN_NUM_BUFFERS;
+
+	return true;
+}
+
+
+
+static void usb_in_ep_callback(uint8_t ep, enum usb_dc_ep_cb_status_code ep_status)
+{
+	if (ep != usb_in_ep) {
+		LOG_ERR("usb_in_ep_callback: unexpected EP 0x%02x", ep);
+		return;
+	}
+
+	if (ep_status != USB_DC_EP_DATA_IN) {
+		LOG_WRN("usb_in_ep_callback: non-IN status 0x%02x", ep_status);
+		return;
+	}
+
+	usb_in_kick();
+}
+
+
+
 
 SYS_INIT(usb_device_init, POST_KERNEL, CONFIG_APPLICATION_INIT_PRIORITY);

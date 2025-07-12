@@ -8,6 +8,24 @@
 #include <zephyr/pm/device.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <soc.h>
+
+#if defined(CONFIG_SPI_3_NRF_SPIM)
+#include <hal/nrf_spim.h>
+
+void spim3_power_on(void)
+{
+	NRF_SPIM3->ENABLE = SPIM_ENABLE_ENABLE_Enabled;
+}
+
+void spim3_power_off(void)
+{
+	NRF_SPIM3->ENABLE = SPIM_ENABLE_ENABLE_Disabled;
+}
+
+#endif
+
+int spim_nrfx_pm_action(const struct device *dev, enum pm_device_action action);
+
 #ifdef CONFIG_SOC_NRF52832_ALLOW_SPIM_DESPITE_PAN_58
 #include <nrfx_gpiote.h>
 #include <nrfx_ppi.h>
@@ -182,6 +200,8 @@ static int configure(const struct device *dev,
 	/* Limit the frequency to that supported by the SPIM instance. */
 	config.frequency = get_nrf_spim_frequency(MIN(spi_cfg->frequency,
 						      max_freq));
+	LOG_INF("Configuring SPI: spi_cfg->frequency = %u, max_freq = %u", spi_cfg->frequency,
+		max_freq);
 	config.mode      = get_nrf_spim_mode(spi_cfg->operation);
 	config.bit_order = get_nrf_spim_bit_order(spi_cfg->operation);
 
@@ -442,7 +462,7 @@ static const struct spi_driver_api spi_nrfx_driver_api = {
 };
 
 #ifdef CONFIG_PM_DEVICE
-static int spim_nrfx_pm_action(const struct device *dev,
+int spim_nrfx_pm_action(const struct device *dev,
 			       enum pm_device_action action)
 {
 	int ret = 0;
@@ -458,6 +478,13 @@ static int spim_nrfx_pm_action(const struct device *dev,
 			return ret;
 		}
 #endif
+
+#if defined(CONFIG_SPI_3_NRF_SPIM)
+		if ((uint32_t)dev_config->spim.p_reg == NRF_SPIM3_BASE) {
+			spim3_power_on();
+		}
+#endif
+
 		/* nrfx_spim_init() will be called at configuration before
 		 * the next transfer.
 		 */
@@ -469,9 +496,14 @@ static int spim_nrfx_pm_action(const struct device *dev,
 			dev_data->initialized = false;
 		}
 
+#if defined(CONFIG_SPI_3_NRF_SPIM)
+		if ((uint32_t)dev_config->spim.p_reg == NRF_SPIM3_BASE) {
+			spim3_power_off();
+		}
+#endif
+
 #ifdef CONFIG_PINCTRL
-		ret = pinctrl_apply_state(dev_config->pcfg,
-					  PINCTRL_STATE_SLEEP);
+		ret = pinctrl_apply_state(dev_config->pcfg, PINCTRL_STATE_SLEEP);
 		if (ret < 0) {
 			return ret;
 		}
@@ -525,95 +557,75 @@ static int spi_nrfx_init(const struct device *dev)
 #define SPIM_PROP(idx, prop)		DT_PROP(SPIM(idx), prop)
 #define SPIM_HAS_PROP(idx, prop)	DT_NODE_HAS_PROP(SPIM(idx), prop)
 
-#define SPIM_NRFX_MISO_PULL(idx)			\
-	(SPIM_PROP(idx, miso_pull_up)			\
-		? SPIM_PROP(idx, miso_pull_down)	\
-			? -1 /* invalid configuration */\
-			: NRF_GPIO_PIN_PULLUP		\
-		: SPIM_PROP(idx, miso_pull_down)	\
-			? NRF_GPIO_PIN_PULLDOWN		\
-			: NRF_GPIO_PIN_NOPULL)
+#define SPIM_NRFX_MISO_PULL(idx)		\
+	(SPIM_PROP(idx, miso_pull_up)	  ? SPIM_PROP(idx, miso_pull_down)                         \
+						    ? -1 /* invalid configuration */               \
+						    : NRF_GPIO_PIN_PULLUP                          \
+	 : SPIM_PROP(idx, miso_pull_down) ? NRF_GPIO_PIN_PULLDOWN                                  \
+					  : NRF_GPIO_PIN_NOPULL)
 
-#define SPI_NRFX_SPIM_EXTENDED_CONFIG(idx)				\
-	IF_ENABLED(NRFX_SPIM_EXTENDED_ENABLED,				\
-		(.dcx_pin = NRFX_SPIM_PIN_NOT_USED,			\
-		 COND_CODE_1(SPIM_PROP(idx, rx_delay_supported),	\
-			     (.rx_delay = SPIM_PROP(idx, rx_delay),),	\
-			     ())					\
-		))
+#define SPI_NRFX_SPIM_EXTENDED_CONFIG(idx)                                                         \
+	IF_ENABLED(NRFX_SPIM_EXTENDED_ENABLED,                                                     \
+		   (.dcx_pin = NRFX_SPIM_PIN_NOT_USED,                                             \
+		    COND_CODE_1(SPIM_PROP(idx, rx_delay_supported),                                \
+				(.rx_delay = SPIM_PROP(idx, rx_delay), ), ())))
 
-#define SPI_NRFX_SPIM_PIN_CFG(idx)					\
-	COND_CODE_1(CONFIG_PINCTRL,					\
-		(.skip_gpio_cfg = true,					\
-		 .skip_psel_cfg = true,),				\
-		(.sck_pin   = SPIM_PROP(idx, sck_pin),			\
-		 .mosi_pin  = DT_PROP_OR(SPIM(idx), mosi_pin,		\
-					 NRFX_SPIM_PIN_NOT_USED),	\
-		 .miso_pin  = DT_PROP_OR(SPIM(idx), miso_pin,		\
-					 NRFX_SPIM_PIN_NOT_USED),	\
-		 .miso_pull = SPIM_NRFX_MISO_PULL(idx),))
+#define SPI_NRFX_SPIM_PIN_CFG(idx)                                                                 \
+	COND_CODE_1(CONFIG_PINCTRL, (.skip_gpio_cfg = true, .skip_psel_cfg = true, ),              \
+		    (.sck_pin = SPIM_PROP(idx, sck_pin),                                           \
+		     .mosi_pin = DT_PROP_OR(SPIM(idx), mosi_pin, NRFX_SPIM_PIN_NOT_USED),          \
+		     .miso_pin = DT_PROP_OR(SPIM(idx), miso_pin, NRFX_SPIM_PIN_NOT_USED),          \
+		     .miso_pull = SPIM_NRFX_MISO_PULL(idx), ))
 
-#define SPI_NRFX_SPIM_DEFINE(idx)					       \
-	NRF_DT_CHECK_PIN_ASSIGNMENTS(SPIM(idx), 1,			       \
-				     sck_pin, mosi_pin, miso_pin);	       \
-	BUILD_ASSERT(IS_ENABLED(CONFIG_PINCTRL) ||			       \
-		     !(SPIM_PROP(idx, miso_pull_up) &&			       \
-		       SPIM_PROP(idx, miso_pull_down)),			       \
-		"SPIM"#idx						       \
-		": cannot enable both pull-up and pull-down on MISO line");    \
-	static void irq_connect##idx(void)				       \
-	{								       \
-		IRQ_CONNECT(DT_IRQN(SPIM(idx)), DT_IRQ(SPIM(idx), priority),   \
-			    nrfx_isr, nrfx_spim_##idx##_irq_handler, 0);       \
-	}								       \
-	IF_ENABLED(SPI_BUFFER_IN_RAM,					       \
-		(static uint8_t spim_##idx##_buffer			       \
-			[CONFIG_SPI_NRFX_RAM_BUFFER_SIZE]		       \
-			SPIM_MEMORY_SECTION(idx);))			       \
-	static struct spi_nrfx_data spi_##idx##_data = {		       \
-		SPI_CONTEXT_INIT_LOCK(spi_##idx##_data, ctx),		       \
-		SPI_CONTEXT_INIT_SYNC(spi_##idx##_data, ctx),		       \
-		SPI_CONTEXT_CS_GPIOS_INITIALIZE(SPIM(idx), ctx)		       \
-		IF_ENABLED(SPI_BUFFER_IN_RAM,				       \
-			(.buffer = spim_##idx##_buffer,))		       \
-		.dev  = DEVICE_DT_GET(SPIM(idx)),			       \
-		.busy = false,						       \
-	};								       \
-	IF_ENABLED(CONFIG_PINCTRL, (PINCTRL_DT_DEFINE(SPIM(idx))));	       \
-	static const struct spi_nrfx_config spi_##idx##z_config = {	       \
-		.spim = {						       \
-			.p_reg = (NRF_SPIM_Type *)DT_REG_ADDR(SPIM(idx)),      \
-			.drv_inst_idx = NRFX_SPIM##idx##_INST_IDX,	       \
-		},							       \
-		.max_freq = SPIM_PROP(idx, max_frequency),		       \
-		.def_config = {						       \
-			SPI_NRFX_SPIM_PIN_CFG(idx)			       \
-			.ss_pin = NRFX_SPIM_PIN_NOT_USED,		       \
-			.orc    = SPIM_PROP(idx, overrun_character),	       \
-			SPI_NRFX_SPIM_EXTENDED_CONFIG(idx)		       \
-		},							       \
-		.irq_connect = irq_connect##idx,			       \
-		COND_CODE_1(CONFIG_SOC_NRF52832_ALLOW_SPIM_DESPITE_PAN_58,     \
-			(.anomaly_58_workaround =			       \
-				SPIM_PROP(idx, anomaly_58_workaround),),       \
-			())						       \
-		IF_ENABLED(CONFIG_PINCTRL,				       \
-			(.pcfg = PINCTRL_DT_DEV_CONFIG_GET(SPIM(idx)),))       \
-	};								       \
-	PM_DEVICE_DT_DEFINE(SPIM(idx), spim_nrfx_pm_action);		       \
-	DEVICE_DT_DEFINE(SPIM(idx),					       \
-		      spi_nrfx_init,					       \
-		      PM_DEVICE_DT_GET(SPIM(idx)),			       \
-		      &spi_##idx##_data,				       \
-		      &spi_##idx##z_config,				       \
-		      POST_KERNEL, CONFIG_SPI_INIT_PRIORITY,		       \
-		      &spi_nrfx_driver_api)
+#define SPI_NRFX_SPIM_DEFINE(idx)                                                                  \
+	NRF_DT_CHECK_PIN_ASSIGNMENTS(SPIM(idx), 1, sck_pin, mosi_pin, miso_pin);                   \
+	BUILD_ASSERT(IS_ENABLED(CONFIG_PINCTRL) ||                                                 \
+			     !(SPIM_PROP(idx, miso_pull_up) && SPIM_PROP(idx, miso_pull_down)),    \
+		     "SPIM" #idx ": cannot enable both pull-up and pull-down on MISO line");       \
+	static void irq_connect##idx(void)                                                         \
+	{                                                                                          \
+		IRQ_CONNECT(DT_IRQN(SPIM(idx)), DT_IRQ(SPIM(idx), priority), nrfx_isr,             \
+			    nrfx_spim_##idx##_irq_handler, 0);                                     \
+	}                                                                                          \
+	IF_ENABLED(                                                                                \
+		SPI_BUFFER_IN_RAM,                                                                 \
+		(static uint8_t                                                                    \
+			 spim_##idx##_buffer[CONFIG_SPI_NRFX_RAM_BUFFER_SIZE] SPIM_MEMORY_SECTION( \
+				 idx);))                                                           \
+	static struct spi_nrfx_data spi_##idx##_data = {                                           \
+		SPI_CONTEXT_INIT_LOCK(spi_##idx##_data, ctx),                                      \
+		SPI_CONTEXT_INIT_SYNC(spi_##idx##_data, ctx),                                      \
+		SPI_CONTEXT_CS_GPIOS_INITIALIZE(SPIM(idx), ctx)                                    \
+			IF_ENABLED(SPI_BUFFER_IN_RAM, (.buffer = spim_##idx##_buffer, ))           \
+				.dev = DEVICE_DT_GET(SPIM(idx)),                                   \
+		.busy = false,                                                                     \
+	};                                                                                         \
+	IF_ENABLED(CONFIG_PINCTRL, (PINCTRL_DT_DEFINE(SPIM(idx))));                                \
+	static const struct spi_nrfx_config spi_##idx##z_config = {                                \
+		.spim =                                                                            \
+			{                                                                          \
+				.p_reg = (NRF_SPIM_Type *)DT_REG_ADDR(SPIM(idx)),                  \
+				.drv_inst_idx = NRFX_SPIM##idx##_INST_IDX,                         \
+			},                                                                         \
+		.max_freq = SPIM_PROP(idx, max_frequency),                                         \
+		.def_config = {SPI_NRFX_SPIM_PIN_CFG(idx).ss_pin = NRFX_SPIM_PIN_NOT_USED,         \
+			       .orc = SPIM_PROP(idx, overrun_character),                           \
+			       SPI_NRFX_SPIM_EXTENDED_CONFIG(idx)},                                \
+		.irq_connect = irq_connect##idx,                                                   \
+		COND_CODE_1(CONFIG_SOC_NRF52832_ALLOW_SPIM_DESPITE_PAN_58,                         \
+			    (.anomaly_58_workaround = SPIM_PROP(idx, anomaly_58_workaround), ),    \
+			    ()) IF_ENABLED(CONFIG_PINCTRL,                                         \
+					   (.pcfg = PINCTRL_DT_DEV_CONFIG_GET(SPIM(idx)), ))};     \
+	PM_DEVICE_DT_DEFINE(SPIM(idx), spim_nrfx_pm_action);                                       \
+	DEVICE_DT_DEFINE(SPIM(idx), spi_nrfx_init, PM_DEVICE_DT_GET(SPIM(idx)), &spi_##idx##_data, \
+			 &spi_##idx##z_config, POST_KERNEL, CONFIG_SPI_INIT_PRIORITY,              \
+			 &spi_nrfx_driver_api)
 
-#define SPIM_MEMORY_SECTION(idx)					       \
-	COND_CODE_1(SPIM_HAS_PROP(idx, memory_regions),			       \
-		(__attribute__((__section__(LINKER_DT_NODE_REGION_NAME(	       \
-			DT_PHANDLE(SPIM(idx), memory_regions)))))),	       \
-		())
+#define SPIM_MEMORY_SECTION(idx)                                                                   \
+	COND_CODE_1(SPIM_HAS_PROP(idx, memory_regions),                                            \
+		    (__attribute__((__section__(                                                   \
+			    LINKER_DT_NODE_REGION_NAME(DT_PHANDLE(SPIM(idx), memory_regions)))))), \
+		    ())
 
 #ifdef CONFIG_SPI_0_NRF_SPIM
 SPI_NRFX_SPIM_DEFINE(0);

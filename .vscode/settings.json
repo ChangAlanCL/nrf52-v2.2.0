@@ -1,0 +1,12 @@
+{
+  "editor.formatOnSave": false,
+  "[cpp]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools"
+  },
+  "[c]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools"
+  },
+  "C_Cpp.default.formatting": "Default", // or "clangFormat"
+  "C_Cpp.clang_format_style": "file",    // or "Google", "LLVM", etc.
+  "C_Cpp.default.compilerPath": ""
+}

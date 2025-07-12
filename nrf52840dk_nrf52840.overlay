@@ -1,0 +1,52 @@
+/delete-node/ &storage_partition;
+ 
+&pinctrl {
+    spi_sdc_default: spi_sdc_default {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK, 1, 6)>,
+                    <NRF_PSEL(SPIM_MOSI, 1, 7)>;
+            nordic,drive-mode = <NRF_DRIVE_H0H1>;
+        };
+        group2 {
+            psels = <NRF_PSEL(SPIM_MISO, 1, 5)>;
+            bias-pull-up;
+            nordic,drive-mode = <NRF_DRIVE_H0H1>;
+        };
+    };
+ 
+    spi_sdc_sleep: spi_sdc_sleep {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK, 1, 6)>,
+                    <NRF_PSEL(SPIM_MOSI, 1, 7)>,
+                    <NRF_PSEL(SPIM_MISO, 1, 5)>;
+            low-power-enable;
+        };
+    };
+};
+ 
+&spi3 {
+    status = "okay";
+    compatible = "nordic,nrf-spim";
+    cs-gpios = <&gpio1 3 GPIO_ACTIVE_LOW>;
+    pinctrl-0 = <&spi_sdc_default>;
+    pinctrl-1 = <&spi_sdc_sleep>;
+    pinctrl-names = "default", "sleep";
+ 
+    sdhc0: sdhc@0 {
+        compatible = "zephyr,sdhc-spi-slot";
+        reg = <0>;
+        status = "okay";
+        spi-max-frequency = <32000000>;  // safer than 32 MHz for now
+ 
+        mmc {
+            compatible = "zephyr,sdmmc-disk";
+            status = "okay";
+        };
+    };
+};
+ 
+/ {
+    aliases {
+        sdmmc0 = &sdhc0;
+    };
+};

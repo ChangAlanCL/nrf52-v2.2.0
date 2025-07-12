@@ -645,6 +645,15 @@ static int sdhc_spi_set_io(const struct device *dev, struct sdhc_io *ios)
 	const struct sdhc_spi_config *cfg = dev->config;
 	struct sdhc_spi_data *data = dev->data;
 
+	/* Allow full speed only after card initialization */
+	if (data->power_mode == SDHC_POWER_ON && ios->clock > 400000 &&
+	    ios->clock < cfg->spi_max_freq) {
+
+		LOG_WRN("Overriding SPI clock: requested %u Hz, forcing %u Hz", ios->clock,
+			cfg->spi_max_freq);
+		ios->clock = cfg->spi_max_freq;
+	}
+
 	if (ios->clock != data->spi_cfg->frequency) {
 		if (ios->clock > cfg->spi_max_freq) {
 			return -ENOTSUP;
@@ -665,6 +674,10 @@ static int sdhc_spi_set_io(const struct device *dev, struct sdhc_io *ios)
 				data->spi_cfg = &data->cfg_a;
 			}
 		}
+		LOG_INF("SPI IO frequency request: %u Hz", ios->clock);
+		LOG_INF("SPI max allowed frequency: %u Hz", cfg->spi_max_freq);
+		LOG_INF("SPI frequency now set to: %u Hz", data->spi_cfg->frequency);
+		// LOG_INF("SPI using DMA: %s", (cfg->use_dma ? "YES" : "NO"));
 	}
 	if (ios->bus_mode != SDHC_BUSMODE_PUSHPULL) {
 		/* SPI mode supports push pull */
@@ -756,27 +769,19 @@ static struct sdhc_driver_api sdhc_spi_api = {
 	.card_busy = sdhc_spi_card_busy,
 };
 
-
-#define SDHC_SPI_INIT(n)							\
-	const struct sdhc_spi_config sdhc_spi_config_##n = {			\
-		.spi_dev = DEVICE_DT_GET(DT_INST_PARENT(n)),			\
-		.pwr_gpio = GPIO_DT_SPEC_INST_GET_OR(n, pwr_gpios, {0}),	\
-		.spi_max_freq = DT_INST_PROP(n, spi_max_frequency),		\
-	};									\
-										\
-	struct sdhc_spi_data sdhc_spi_data_##n = {				\
-		.cfg_a = SPI_CONFIG_DT_INST(n,					\
-				(SPI_LOCK_ON | SPI_HOLD_ON_CS | SPI_WORD_SET(8)),\
-				0),						\
-	};									\
-										\
-	DEVICE_DT_INST_DEFINE(n,						\
-			&sdhc_spi_init,						\
-			NULL,							\
-			&sdhc_spi_data_##n,					\
-			&sdhc_spi_config_##n,					\
-			POST_KERNEL,						\
-			CONFIG_SDHC_INIT_PRIORITY,				\
-			&sdhc_spi_api);
+#define SDHC_SPI_INIT(n)                                                                           \
+	const struct sdhc_spi_config sdhc_spi_config_##n = {                                       \
+		.spi_dev = DEVICE_DT_GET(DT_INST_PARENT(n)),                                       \
+		.pwr_gpio = GPIO_DT_SPEC_INST_GET_OR(n, pwr_gpios, {0}),                           \
+		.spi_max_freq = DT_INST_PROP(n, spi_max_frequency),                                \
+	};                                                                                         \
+                                                                                                   \
+	struct sdhc_spi_data sdhc_spi_data_##n = {                                                 \
+		.cfg_a = SPI_CONFIG_DT_INST(n, (SPI_LOCK_ON | SPI_HOLD_ON_CS | SPI_WORD_SET(8)),   \
+					    0),                                                    \
+	};                                                                                         \
+                                                                                                   \
+	DEVICE_DT_INST_DEFINE(n, &sdhc_spi_init, NULL, &sdhc_spi_data_##n, &sdhc_spi_config_##n,   \
+			      POST_KERNEL, CONFIG_SDHC_INIT_PRIORITY, &sdhc_spi_api);
 
 DT_INST_FOREACH_STATUS_OKAY(SDHC_SPI_INIT)
